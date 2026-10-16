@@ -6,10 +6,16 @@ from copy import deepcopy
 import asyncio
 from PyQt5.QtCore import QObject
 
-from .exceptions import SummonerRankInfoNotFound
+from . import match_history_cache
+from .exceptions import (SgpServerUnavailable, SummonerGamesNotFound,
+                         SummonerRankInfoNotFound)
 from ..common.config import cfg, Language
 from ..lol.connector import connector
 from ..common.signals import signalBus
+from ..common.logger import logger
+
+
+TAG = "Tools"
 
 
 SERVERS_NAME = {
@@ -93,13 +99,22 @@ def secsToStr(secs):
     return time.strftime("%M:%S", time.gmtime(secs))
 
 
-async def getRecentTeammates(games, puuid):
+async def summarizeTeammates(teammatesList, puuid):
+    """
+    汇总多局对战的队友信息
+
+    Args:
+        teammatesList (list): `getTeammates` / `getTeammatesFromSGPGame` 的返回值列表
+        puuid (str): 目标召唤师 puuid
+
+    Returns:
+        dict: {"puuid": puuid, "summoners": [按同队局数降序的前 5 名队友]}
+    """
     summoners = {}
 
-    for game in games:
-        gameId = game['gameId']
-        game = await connector.getGameDetailByGameId(gameId)
-        teammates = getTeammates(game, puuid)
+    for teammates in teammatesList:
+        if not teammates:
+            continue
 
         for p in teammates['summoners']:
             if p['summonerId'] == 0:
@@ -128,7 +143,79 @@ async def getRecentTeammates(games, puuid):
     return ret
 
 
+async def getRecentTeammates(games, puuid):
+    """
+    逐局查询对局详情获取队友 (LCU 路径)
+
+    @see fetchSummonerTeammates
+    """
+    teammatesList = []
+
+    for game in games:
+        detail = await fetchGameDetail(game['gameId'])
+        teammatesList.append(getTeammates(detail, puuid))
+
+    return await summarizeTeammates(teammatesList, puuid)
+
+
+async def getRecentTeammatesViaSGP(games, puuid):
+    """
+    SGP 路径获取队友
+
+    SGP 的战绩列表自带当局全部 participants, 因此一次请求即可覆盖多局,
+    不需要像 LCU 那样逐局查询详情
+
+    Raises:
+        SummonerGamesNotFound: 接口返回的内容中不包含对局数据
+    """
+    if not games:
+        return await summarizeTeammates([], puuid)
+
+    res = await connector.getSummonerGamesByPuuidViaSGP(
+        puuid, 0, len(games) - 1)
+
+    if "games" not in res:
+        raise SummonerGamesNotFound()
+
+    teammatesList = []
+
+    for game in res['games']:
+        try:
+            teammatesList.append(getTeammatesFromSGPGame(game, puuid))
+        except Exception as e:
+            logger.debug(f"解析某局 SGP 对局队友失败, 已跳过: {e!r}", TAG)
+
+    return await summarizeTeammates(teammatesList, puuid)
+
+
+async def fetchSummonerTeammates(games, puuid):
+    """
+    统一的"最近队友"获取入口
+
+    - 国服: 优先复用 SGP 战绩列表(一次请求), 失败时回退到逐局查询详情
+    - 其他服务器: 保持原有 LCU 路径
+
+    @see summarizeTeammates
+    """
+    if connector.isInTencent():
+        try:
+            return await getRecentTeammatesViaSGP(games, puuid)
+        except SummonerGamesNotFound:
+            logger.info("SGP 战绩为空, 回退到 LCU 获取最近队友", TAG)
+        except Exception as e:
+            logger.warning(f"SGP 获取最近队友失败, 回退到 LCU: {e!r}", TAG)
+
+    return await getRecentTeammates(games, puuid)
+
+
 async def parseSummonerData(summoner, rankTask, gameTask):
+    """
+    Args:
+        summoner: LCU 返回的召唤师信息
+        rankTask: 待完成的排位信息任务
+        gameTask: 待完成的战绩任务, 完成后应得到**已解析**的对局信息列表
+                  (即 `fetchSummonerGames` 的返回值)
+    """
     iconId = summoner['profileIconId']
     icon = await connector.getProfileIcon(iconId)
     level = summoner['summonerLevel']
@@ -136,13 +223,13 @@ async def parseSummonerData(summoner, rankTask, gameTask):
     xpUntilNextLevel = summoner['xpUntilNextLevel']
 
     try:
-        gamesInfo = await gameTask
+        parsedGames = await gameTask
     except:
         champions = []
         games = {}
     else:
         games = {
-            "gameCount": gamesInfo["gameCount"],
+            "gameCount": len(parsedGames),
             "wins": 0,
             "losses": 0,
             "kills": 0,
@@ -150,8 +237,7 @@ async def parseSummonerData(summoner, rankTask, gameTask):
             "assists": 0,
             "games": [],
         }
-        for game in gamesInfo["games"]:
-            info = await parseGameData(game)
+        for info in parsedGames:
             if time.time() - info["timeStamp"] / 1000 > 60 * 60 * 24 * 365:
                 continue
             if not info["remake"] and info["queueId"] != 0:
@@ -487,6 +573,150 @@ async def parseGameDetailData(puuid, game):
         'remake': remake,
         'teams': teams,
     }
+
+
+def isLcuGameDetail(game):
+    """
+    判断是否为合法的 LCU 对局详情
+
+    `connector.getGameDetailByGameId` 在取不到数据时会返回错误信息而不是对局详情,
+    这里用几个 LCU 独有的字段做区分
+    """
+    return (isinstance(game, dict)
+            and 'teams' in game
+            and 'participantIdentities' in game
+            and 'participants' in game)
+
+
+def lcuGameShapeFromSGP(game):
+    """
+    把 SGP 的对局 json 转换为 LCU 对局详情的结构
+
+    SGP 的 ``participants`` 是扁平字段, 也没有 ``participantIdentities``,
+    这里把两者对齐, 使 `getTeammates` / `parseGameDetailData` 可以直接复用;
+    SGP 缺失的字段一律降级为 0 或空列表, 避免渲染时抛异常
+
+    Args:
+        game (dict): SGP 对局 json, @see connector.getGameDetailByGameIdViaSGP
+
+    Returns:
+        dict: 与 `connector.getGameDetailByGameId` 返回值同构的对局详情
+    """
+    teams = []
+
+    for team in game.get('teams') or []:
+        objectives = team.get('objectives') or {}
+
+        def killsOf(name):
+            return (objectives.get(name) or {}).get('kills', 0)
+
+        teams.append({
+            'teamId': team.get('teamId', 0),
+            'win': team.get('win', False),
+            'bans': [{'championId': ban.get('championId', 0)}
+                     for ban in (team.get('bans') or [])],
+            'baronKills': killsOf('baron'),
+            'dragonKills': killsOf('dragon'),
+            'riftHeraldKills': killsOf('riftHerald'),
+            'towerKills': killsOf('tower'),
+            'inhibitorKills': killsOf('inhibitor'),
+        })
+
+    identities = []
+    participants = []
+
+    for index, player in enumerate(game.get('participants') or [], start=1):
+        participantId = player.get('participantId', index)
+
+        identities.append({
+            'participantId': participantId,
+            'player': {
+                'puuid': player.get('puuid'),
+                'gameName': (player.get('riotIdGameName')
+                             or player.get('summonerName')),
+                'summonerName': player.get('summonerName'),
+            },
+        })
+
+        # SGP 把符文放在 perks.styles[0].selections[0].perk
+        styles = (player.get('perks') or {}).get('styles') or [{}]
+        selections = styles[0].get('selections') or [{}]
+
+        stats = {
+            'win': player.get('win', False),
+            'kills': player.get('kills', 0),
+            'deaths': player.get('deaths', 0),
+            'assists': player.get('assists', 0),
+            'goldEarned': player.get('goldEarned', 0),
+            'champLevel': player.get('champLevel', 0),
+            'totalMinionsKilled': player.get('totalMinionsKilled', 0),
+            'neutralMinionsKilled': player.get('neutralMinionsKilled', 0),
+            'totalDamageDealtToChampions': player.get(
+                'totalDamageDealtToChampions', 0),
+            'perk0': selections[0].get('perk', 0),
+            'gameEndedInEarlySurrender': player.get(
+                'gameEndedInEarlySurrender', False),
+            'teamEarlySurrendered': player.get('teamEarlySurrendered', False),
+            'subteamPlacement': player.get('subteamPlacement', 0),
+        }
+
+        for i in range(7):
+            stats[f'item{i}'] = player.get(f'item{i}', 0)
+
+        participants.append({
+            'participantId': participantId,
+            'teamId': player.get('teamId', 0),
+            'championId': player.get('championId', 0),
+            'spell1Id': player.get('spell1Id', 0),
+            'spell2Id': player.get('spell2Id', 0),
+            'stats': stats,
+        })
+
+    return {
+        'gameId': game.get('gameId'),
+        'queueId': game.get('queueId'),
+        'mapId': game.get('mapId'),
+        'gameCreation': game.get('gameCreation'),
+        'gameDuration': game.get('gameDuration'),
+        'teams': teams,
+        'participantIdentities': identities,
+        'participants': participants,
+    }
+
+
+async def fetchGameDetail(gameId):
+    """
+    统一的单局对局详情获取入口
+
+    优先使用 LCU 接口; 当 LCU 返回的内容不是合法的对局详情时(国服),
+    回退到 SGP 接口并把结果转换为 LCU 结构, @see lcuGameShapeFromSGP
+
+    Args:
+        gameId (int | str): 对局 ID
+
+    Returns:
+        dict: 对局详情, @see connector.getGameDetailByGameId
+    """
+    game = await connector.getGameDetailByGameId(gameId)
+
+    if isLcuGameDetail(game):
+        return game
+
+    if not connector.isInTencent():
+        return game
+
+    try:
+        sgpGame = await connector.getGameDetailByGameIdViaSGP(gameId)
+    except Exception as e:
+        logger.warning(f"SGP 对局详情请求失败: {e!r}", TAG)
+        return game
+
+    if isinstance(sgpGame, dict) and sgpGame.get('participants'):
+        return lcuGameShapeFromSGP(sgpGame)
+
+    logger.warning(f"SGP 对局详情内容异常: {sgpGame!r}", TAG)
+
+    return game
 
 
 def getTeammates(game, targetPuuid):
@@ -992,6 +1222,144 @@ def separateTeams(data, currentSummonerId):
 async def parseGamesDataConcurrently(games):
     tasks = [parseGameData(game) for game in games]
     return await asyncio.gather(*tasks)
+
+
+# SGP(GAMHS) 战绩接口单次请求的对局条数(保守取值, 便于必要时调整)
+SGP_MATCH_HISTORY_PAGE_SIZE = 15
+
+
+async def fetchSummonerGamesViaSGP(puuid, begIndex, endIndex):
+    """
+    国服战绩获取: 走 SGP(GAMHS) 接口, 与官方客户端保持一致
+
+    SGP 单次请求有条数上限, 超出时按 `SGP_MATCH_HISTORY_PAGE_SIZE` 分页拉取
+
+    Args:
+        puuid (str): 召唤师的 PUUID
+        begIndex (int): 起始索引 (包含)
+        endIndex (int): 结束索引 (包含)
+
+    Returns:
+        list: 已解析的对局信息列表, 字段见 `parseGamesDataFromSGP`
+
+    Raises:
+        SummonerGamesNotFound: 接口返回的内容中不包含对局数据
+    """
+    rawGames = []
+
+    start = begIndex
+    while start <= endIndex:
+        end = min(start + SGP_MATCH_HISTORY_PAGE_SIZE - 1, endIndex)
+        res = await connector.getSummonerGamesByPuuidViaSGP(puuid, start, end)
+
+        if "games" not in res:
+            if not rawGames:
+                raise SummonerGamesNotFound()
+            break
+
+        page = res["games"]
+        rawGames.extend(page)
+
+        if len(page) < end - start + 1:  # 已经取到最后一页
+            break
+
+        start = end + 1
+
+    if begIndex == 0 and rawGames:
+        # 顺手刷新本地缓存, 供接口不可用时降级展示, @see match_history_cache
+        match_history_cache.saveGames(puuid, rawGames)
+
+    return await asyncio.gather(
+        *[parseGamesDataFromSGP(game, puuid) for game in rawGames]
+    )
+
+
+async def loadCachedSummonerGames(puuid, begIndex, endIndex):
+    """
+    取出本地缓存中的对局, 按区间解析后返回
+
+    @see match_history_cache
+
+    Args:
+        puuid (str): 召唤师的 PUUID
+        begIndex (int): 起始索引 (包含)
+        endIndex (int): 结束索引 (包含)
+
+    Returns:
+        list | None: 已解析的对局信息列表; 无可用缓存时返回 ``None``
+                     (用 ``None`` 而不是空列表, 以便和「缓存里就是空」区分开)
+    """
+    rawGames = match_history_cache.loadGames(puuid)
+
+    if not rawGames:
+        return None
+
+    window = rawGames[begIndex:endIndex + 1]
+
+    if not window:
+        return None
+
+    return await asyncio.gather(
+        *[parseGamesDataFromSGP(game, puuid) for game in window]
+    )
+
+
+async def fetchSummonerGames(puuid, begIndex=0, endIndex=4, slowly=False):
+    """
+    统一的战绩获取入口
+
+    - 国服: 旧 LCU 战绩列表接口
+      (``/lol-match-history/v1/products/lol/{puuid}/matches``) 已不可用,
+      优先走 SGP(GAMHS) 接口(与官方客户端一致), 失败时回退到 LCU;
+      若接口返回 5xx(服务端故障), 则降级展示本地缓存, @see match_history_cache
+    - 其他服务器: 保持原有 LCU 接口
+
+    与 `parseGamesDataConcurrently` 不同, 本函数返回的是**已解析**的对局信息列表,
+    因此调用方不需要再自行解析
+
+    Args:
+        puuid (str): 召唤师的 PUUID
+        begIndex (int): 起始索引 (包含)
+        endIndex (int): 结束索引 (包含)
+        slowly (bool): 走 LCU 时是否使用低并发接口, 避免 LCU 负载过高
+
+    Returns:
+        list: 已解析的对局信息列表, 元素字段见 `parseGameData` / `parseGamesDataFromSGP`
+
+    Raises:
+        SummonerGamesNotFound: 接口返回的内容中不包含对局数据
+        SgpServerUnavailable: 国服战绩接口 5xx 且没有可用的本地缓存
+    """
+    if connector.isInTencent():
+        try:
+            return await fetchSummonerGamesViaSGP(puuid, begIndex, endIndex)
+        except SummonerGamesNotFound:
+            # SGP 取不到数据时回退到 LCU, 由调用方处理结果(可能同样为空)
+            logger.info("SGP 战绩为空, 回退到 LCU", TAG)
+        except SgpServerUnavailable as e:
+            # 服务端 5xx: 并非「没有对局」, 也不能回退到 LCU(走的是同一后端, 同样不可用);
+            # 先尝试本地缓存(与官方客户端的 MatchHistoryCache 同理), 命中就照常展示
+            cachedGames = await loadCachedSummonerGames(puuid, begIndex, endIndex)
+
+            if cachedGames is not None:
+                logger.error("SGP 战绩服务端不可用, 已降级为本地缓存", TAG)
+                signalBus.matchHistoryCacheUsed.emit(puuid)
+                return cachedGames
+
+            logger.error("SGP 战绩服务端不可用, 且无可用缓存, 不再回退 LCU", TAG)
+            signalBus.lcuApiExceptionRaised.emit('fetchSummonerGames', e)
+            raise
+        except Exception as e:
+            logger.warning(f"SGP 战绩请求失败, 回退到 LCU: {e!r}", TAG)
+
+    if slowly:
+        gamesInfo = await connector.getSummonerGamesByPuuidSlowly(
+            puuid, begIndex, endIndex)
+    else:
+        gamesInfo = await connector.getSummonerGamesByPuuid(
+            puuid, begIndex, endIndex)
+
+    return await parseGamesDataConcurrently(gamesInfo["games"])
 
 
 async def parseSummonerGameInfo(item, isRank, currentSummonerId):

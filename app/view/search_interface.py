@@ -29,8 +29,9 @@ from app.components.summoner_name_button import SummonerName
 from app.components.animation_frame import ColorAnimationFrame, CardWidget
 from app.components.color_label import ColorLabel, DeathsLabel
 from app.lol.connector import connector
-from app.lol.exceptions import SummonerGamesNotFound, SummonerNotFound
-from app.lol.tools import parseGameData, parseGameDetailData, parseGamesDataConcurrently
+from app.lol.exceptions import (SgpServerUnavailable, SummonerGamesNotFound,
+                                SummonerNotFound)
+from app.lol.tools import parseGameData, parseGameDetailData, fetchSummonerGames, fetchGameDetail
 from ..components.seraphine_interface import SeraphineInterface
 
 
@@ -1240,11 +1241,12 @@ class SearchInterface(SeraphineInterface):
 
             # 先加载两页，让用户看着
             try:
-                games = await connector.getSummonerGamesByPuuid(self.puuid, 0, 19)
+                games = await fetchSummonerGames(self.puuid, 0, 19)
             except SummonerGamesNotFound:
                 games = []
-            else:
-                games = await parseGamesDataConcurrently(games['games'])
+            except SgpServerUnavailable:
+                # 服务端暂时不可用(connector 已上报, 会有提示条), 这里按无数据降级
+                games = []
 
             if len(games) == 0:
                 self.gamesView.gamesTab.nextButton.setVisible(False)
@@ -1335,12 +1337,14 @@ class SearchInterface(SeraphineInterface):
 
             t1 = time.time()
             try:
-                games = await connector.getSummonerGamesByPuuidSlowly(
-                    puuid, begIdx, endIdx)
+                games = await fetchSummonerGames(
+                    puuid, begIdx, endIdx, slowly=True)
             except SummonerGamesNotFound:
-                # TODO 这里可以弹个窗  -- By Zzaphkiel
-                # NOTE 触发 SummonerGamesNotFound 时, 异常信息会通过 connector 下发到 main_window 的 __onShowLcuConnectError
-                #  理论上会有弹框提示  -- By Hpero4
+                # NOTE 触发 SummonerGamesNotFound 时, 异常会通过 connector 下发到
+                #  main_window 的 __onShowLcuConnectError; 该异常属于预期内的结果, 不会弹窗提示
+                return
+            except SgpServerUnavailable:
+                # 服务端 5xx(connector 已上报, 会有提示条), 停止继续翻页
                 return
             t2 = time.time()
 
@@ -1348,11 +1352,11 @@ class SearchInterface(SeraphineInterface):
                 f"load games {self.puuid} [{begIdx}-{endIdx}] finish {t2-t1}s", TAG)
             # 1000 局搜完了，或者正好上一次就是最后
             # 在切换了puuid时, 就不要再把数据刷到Games上了 -- By Hpero4
-            if games['gameCount'] == 0 or self.puuid != puuid:
+            if len(games) == 0 or self.puuid != puuid:
                 return
 
-            # 处理数据，交给 gamesTab，更新其 games 成员以及 queueIdMap
-            games = await parseGamesDataConcurrently(games['games'])
+            # fetchSummonerGames 返回的已是解析后的对局列表, 直接交给 gamesTab
+            # 更新其 games 成员以及 queueIdMap
 
             if self.puuid != puuid:
                 return
@@ -1402,7 +1406,7 @@ class SearchInterface(SeraphineInterface):
 
         # NOTE self.detailViewLoadTask 用于标记详情正在加载, self.loadGame会为其让行 -- By Hpero4
         self.detailViewLoadTask = asyncio.create_task(
-            connector.getGameDetailByGameId(gameId))
+            fetchGameDetail(gameId))
         game = await self.detailViewLoadTask
 
         # 加载GameDetail的过程中, 切换了搜索对象(self.puuid变更), 将后续任务pass -- By Hpero4

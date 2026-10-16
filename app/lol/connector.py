@@ -1112,7 +1112,56 @@ class LolClientConnector(QObject):
         }
 
         res = await self.__sgp__get(url, params)
+
+        # 服务端 5xx 时响应体形如 {"status": {"message": ..., "status_code": 503}};
+        # 若直接交给上层解析, 会因缺少 "games" 字段被误判为「该召唤师没有对局」,
+        # 导致界面一片空白且没有任何提示, 因此这里显式区分出「服务端暂时不可用」
+        if res.status >= 500:
+            body = await res.text()
+            # 5xx 属于服务端暂时性故障, 与「该召唤师没有对局」是两回事, 必须区分开,
+            # 否则界面会一片空白且没有任何提示;
+            # 是否弹提示/是否降级为本地缓存, 交由调用方决定
+            logger.error(
+                f"SGP 战绩接口返回 {res.status}: {body[:200]}", TAG)
+            raise SgpServerUnavailable(res.status)
+
         return await res.json()
+
+    async def getGameDetailByGameIdViaSGP(self, gameId):
+        """
+        通过 SGP 获取单局对局详情
+
+        注意该接口的 matchId 需要带上大区前缀(如 ``HN10_8595461971``),
+        返回值结构与 LCU 的 ``/lol-match-history/v1/games/{gameId}`` 不同,
+        需要经由 `app.lol.tools.lcuGameShapeFromSGP` 转换
+        """
+        assert self.inTencent
+
+        matchId = f"{self.server.upper()}_{gameId}"
+
+        logger.debug(
+            f"getGameDetailByGameIdViaSGP called, {matchId = }", TAG)
+
+        # NOTE 官方客户端使用 v1 的 `products/lol/{matchId}/{infoType}` 形式,
+        # 而旧代码使用的 `/v3/product/LoL/matchId/.../summary` 在国服并不存在
+        # (恒返回 403), 因此这里改为与客户端一致; DETAILS 含符文/装备等明细,
+        # 取不到时退回 SUMMARY
+        res = None
+
+        for infoType in ('DETAILS', 'SUMMARY'):
+            url = f"/match-history-query/v1/products/lol/{matchId}/{infoType}"
+            resp = await self.__sgp__get(url)
+            data = await resp.json()
+
+            if isinstance(data, dict) and data.get('participants'):
+                return data
+
+            logger.warning(
+                f"SGP 对局详情 {infoType} 返回 {resp.status} 且内容异常: "
+                f"{str(data)[:200]}", TAG)
+            res = data
+
+        return res
 
     async def getSummonerGamingInfoByPuuidViaSgp(self, puuid):
         logger.debug(

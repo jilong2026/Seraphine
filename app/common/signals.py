@@ -23,6 +23,9 @@ class SignalBus(QObject):
     # career_interface
     careerGameBarClicked = pyqtSignal(str)
 
+    # 国服战绩: 接口 5xx 时降级展示本地缓存, 载荷为 puuid
+    matchHistoryCacheUsed = pyqtSignal(str)
+
     # search_interface:
     gameTabClicked = pyqtSignal(QWidget)
 

@@ -38,6 +38,7 @@ from app.components.message_box import (UpdateMessageBox, NoticeMessageBox,
                                         WaitingForLolMessageBox, ExceptionMessageBox,
                                         ChangeDpiMessageBox)
 from app.lol.exceptions import (SummonerGamesNotFound, RetryMaximumAttempts,
+                                SgpServerUnavailable,
                                 SummonerNotFound, SummonerNotInGame, SummonerRankInfoNotFound)
 from app.lol.listener import (LolProcessExistenceListener, StoppableThread)
 from app.lol.connector import connector
@@ -230,6 +231,8 @@ class MainWindow(FluentWindow):
             self.__onChampSelectChanged)
         signalBus.lcuApiExceptionRaised.connect(
             self.__onShowLcuConnectError)
+        signalBus.matchHistoryCacheUsed.connect(
+            self.__onMatchHistoryCacheUsed)
         signalBus.getCmdlineError.connect(
             self.__showNeedAdminMessageBox)
 
@@ -290,12 +293,18 @@ class MainWindow(FluentWindow):
             self.lastTipsTime = time.time()
             self.lastTipsType = type(obj)
 
-        if type(obj) in [SummonerGamesNotFound, SummonerRankInfoNotFound]:
+        if type(obj) is SummonerRankInfoNotFound:
             msg = self.tr(
                 "The server returned abnormal content, which may be under maintenance.")
         elif type(obj) is RetryMaximumAttempts:
             msg = self.tr("Exceeded maximum retry attempts.")
-        elif type(obj) in [SummonerNotFound, SummonerNotInGame]:
+        elif type(obj) is SgpServerUnavailable:
+            # 服务端 5xx 必须让用户看得见, 否则与「真的没有战绩」无法区分
+            msg = self.tr("Match history service is temporarily unavailable") \
+                + f" (HTTP {obj.status})"
+        elif type(obj) in [SummonerNotFound, SummonerNotInGame, SummonerGamesNotFound]:
+            # 服务端正常返回、只是没有对局, 生涯页/搜索页对此已有降级表现,
+            # 不需要再弹窗提示
             return
         else:
             msg = repr(obj)
@@ -303,6 +312,25 @@ class MainWindow(FluentWindow):
         InfoBar.error(
             self.tr("LCU request error"),
             self.tr(f"Connect API") + f" {api}: {msg}",
+            duration=5000,
+            orient=Qt.Vertical,
+            parent=self,
+            position=InfoBarPosition.BOTTOM_RIGHT
+        )
+
+    @asyncSlot(str)
+    async def __onMatchHistoryCacheUsed(self, puuid):
+        """
+        战绩接口 5xx, 当前展示的是本地缓存(与官方客户端的 MatchHistoryCache 同理)
+
+        这是降级展示而非错误, 因此用警告色, 并明确说明数据来源
+        """
+        logger.warning(
+            f"战绩接口不可用, 展示本地缓存: {puuid}", TAG)
+
+        InfoBar.warning(
+            self.tr("Match history service is temporarily unavailable"),
+            self.tr("Showing locally cached match history."),
             duration=5000,
             orient=Qt.Vertical,
             parent=self,

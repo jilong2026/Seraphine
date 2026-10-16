@@ -23,7 +23,8 @@ from app.common.signals import signalBus
 from app.common.config import cfg
 from app.lol.connector import connector
 from app.lol.tools import (parseGames, parseSummonerData,
-                           getRecentTeammates, parseDetailRankInfo, SERVERS_NAME, SERVERS_SUBSET)
+                           fetchSummonerTeammates, parseDetailRankInfo,
+                           SERVERS_NAME, SERVERS_SUBSET, fetchSummonerGames)
 from ..components.seraphine_interface import SeraphineInterface
 
 
@@ -404,7 +405,7 @@ class CareerInterface(SeraphineInterface):
             return
 
         self.loadGamesTask = asyncio.create_task(
-            connector.getSummonerGamesByPuuid(summoner['puuid'], 0, cfg.get(cfg.careerGamesNumber) - 1))
+            fetchSummonerGames(summoner['puuid'], 0, cfg.get(cfg.careerGamesNumber) - 1))
         rankTask = asyncio.create_task(
             connector.getRankedStatsByPuuid(summoner['puuid']))
 
@@ -594,7 +595,7 @@ class CareerInterface(SeraphineInterface):
         self.recentTeammatesFlyout = None
 
     async def __updateRecentTeammates(self):
-        self.recentTeammatesInfo = await getRecentTeammates(self.games['games'], self.puuid)
+        self.recentTeammatesInfo = await fetchSummonerTeammates(self.games['games'], self.puuid)
 
         if self.recentTeammatesFlyout:
             self.recentTeammatesFlyout.close()
